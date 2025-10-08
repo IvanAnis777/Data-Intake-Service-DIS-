@@ -1,0 +1,195 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11, 3.12, 3.13]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest-cov black isort mypy
+    
+    - name: Lint with flake8
+      run: |
+        flake8 app/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 app/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Format check with black
+      run: |
+        black --check app/ tests/
+    
+    - name: Import sorting check with isort
+      run: |
+        isort --check-only app/ tests/
+    
+    - name: Type check with mypy
+      run: |
+        mypy app/ --ignore-missing-imports
+    
+    - name: Test with pytest
+      run: |
+        pytest tests/ -v --cov=app --cov-report=xml --cov-report=html
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety bandit
+    
+    - name: Security check with safety
+      run: |
+        safety check --json --output safety-report.json || true
+    
+    - name: Security check with bandit
+      run: |
+        bandit -r app/ -f json -o bandit-report.json || true
+
+  api-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Start application
+      run: |
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        sleep 10
+    
+    - name: Health check
+      run: |
+        curl -f http://localhost:8000/healthz || exit 1
+        curl -f http://localhost:8000/readyz || exit 1
+    
+    - name: API contract tests
+      run: |
+        # Проверяем OpenAPI схему
+        curl -f http://localhost:8000/openapi.json | jq '.info.title' | grep "Data Intake Service"
+        
+        # Проверяем Swagger UI
+        curl -f http://localhost:8000/docs
+    
+    - name: Integration tests
+      run: |
+        # Создаем Item
+        ITEM_RESPONSE=$(curl -s -X POST "http://localhost:8000/api/v1/items" \
+          -H "Content-Type: application/json" \
+          -d '{"sku": "TEST-001", "title": "Test Item"}')
+        
+        # Проверяем ответ
+        echo $ITEM_RESPONSE | jq '.id' | grep -v null
+        echo $ITEM_RESPONSE | jq '.sku' | grep "TEST-001"
+        
+        # Получаем Item по ID
+        ITEM_ID=$(echo $ITEM_RESPONSE | jq '.id')
+        curl -f "http://localhost:8000/api/v1/items/$ITEM_ID"
+        
+        # Получаем список Items
+        curl -f "http://localhost:8000/api/v1/items"
+
+  performance:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install locust
+    
+    - name: Start application
+      run: |
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        sleep 10
+    
+    - name: Performance test
+      run: |
+        # Простой нагрузочный тест
+        for i in {1..100}; do
+          curl -s http://localhost:8000/healthz > /dev/null
+        done
+        
+        # Проверяем время ответа
+        curl -w "@curl-format.txt" -o /dev/null -s http://localhost:8000/healthz
+    
+    - name: Create curl format file
+      run: |
+        echo 'time_namelookup:  %{time_namelookup}\n' > curl-format.txt
+        echo 'time_connect:     %{time_connect}\n' >> curl-format.txt
+        echo 'time_appconnect:  %{time_appconnect}\n' >> curl-format.txt
+        echo 'time_pretransfer: %{time_pretransfer}\n' >> curl-format.txt
+        echo 'time_redirect:    %{time_redirect}\n' >> curl-format.txt
+        echo 'time_starttransfer: %{time_starttransfer}\n' >> curl-format.txt
+        echo 'time_total:       %{time_total}\n' >> curl-format.txt
+
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check ADR exists
+      run: |
+        test -f docs/ADR-001-architecture.md || exit 1
+        test -f docs/DoD-checklist.md || exit 1
+        test -f README.md || exit 1
+    
+    - name: Check documentation quality
+      run: |
+        # Проверяем, что README содержит ключевые разделы
+        grep -q "## Цели проекта" README.md
+        grep -q "## Как запускать" README.md
+        grep -q "## API Endpoints" README.md
+        
+        # Проверяем, что ADR содержит все разделы
+        grep -q "## Статус" docs/ADR-001-architecture.md
+        grep -q "## Контекст" docs/ADR-001-architecture.md
+        grep -q "## Решение" docs/ADR-001-architecture.md
+        grep -q "## Последствия" docs/ADR-001-architecture.md
