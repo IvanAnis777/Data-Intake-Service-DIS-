@@ -32,3 +32,5 @@ def test_root_endpoint():
     assert "version" in data
     assert "docs" in data
 
+
+
