@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
 from app.database.connection import get_db
-from app.models.item import Item, ItemCreate, ItemResponse
-from typing import List
+from app.models.item import Item, ItemCreate, ItemResponse, ItemListResponse
+from app.utils.cursor import encode_cursor, validate_cursor
+from typing import Optional
 import structlog
 
 logger = structlog.get_logger()
@@ -13,6 +15,27 @@ router = APIRouter()
 async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     """
     Создание нового Item
+    
+    Поддерживает идемпотентность через заголовок Idempotency-Key.
+    При повторном запросе с тем же ключом и телом возвращает тот же результат.
+    
+    Headers:
+        Idempotency-Key (optional): Уникальный ключ для обеспечения идемпотентности.
+                                   Должен быть 1-255 символов, содержать только буквы,
+                                   цифры, дефисы и подчёркивания.
+    
+    Examples:
+        POST /api/v1/items
+        Idempotency-Key: client-request-123
+        Content-Type: application/json
+        
+        {
+            "sku": "ITEM-001",
+            "title": "Sample Item",
+            "status": "active",
+            "brand": "Brand A",
+            "category": "Electronics"
+        }
     """
     logger.info("Creating new item", sku=item.sku, title=item.title)
     
@@ -26,7 +49,13 @@ async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
         )
     
     # Создаем новый Item
-    db_item = Item(sku=item.sku, title=item.title)
+    db_item = Item(
+        sku=item.sku, 
+        title=item.title,
+        status=item.status,
+        brand=item.brand,
+        category=item.category
+    )
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
@@ -53,12 +82,77 @@ async def get_item(item_id: int, db: Session = Depends(get_db)):
     return item
 
 
-@router.get("/items", response_model=list[ItemResponse])
-async def list_items(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+@router.get("/items", response_model=ItemListResponse)
+async def list_items(
+    limit: int = Query(default=100, ge=1, le=1000, description="Количество элементов на странице"),
+    cursor: Optional[str] = Query(default=None, description="Курсор для пагинации"),
+    status: Optional[str] = Query(default=None, description="Фильтр по статусу"),
+    brand: Optional[str] = Query(default=None, description="Фильтр по бренду"),
+    category: Optional[str] = Query(default=None, description="Фильтр по категории"),
+    db: Session = Depends(get_db)
+):
     """
-    Получение списка Items (простая пагинация, позже заменим на курсорную)
-    """
-    logger.info("Listing items", skip=skip, limit=limit)
+    Получение списка Items с курсорной пагинацией
     
-    items = db.query(Item).offset(skip).limit(limit).all()
-    return items
+    Использует keyset pagination на паре (created_at, id) для стабильной и производительной пагинации.
+    Поддерживает фильтрацию по статусу, бренду и категории.
+    """
+    logger.info("Listing items with cursor pagination", 
+                limit=limit, cursor=cursor, status=status, brand=brand, category=category)
+    
+    # Валидируем курсор
+    cursor_data = validate_cursor(cursor)
+    
+    # Строим базовый запрос
+    query = db.query(Item)
+    
+    # Применяем фильтры
+    filters = []
+    if status:
+        filters.append(Item.status == status)
+    if brand:
+        filters.append(Item.brand == brand)
+    if category:
+        filters.append(Item.category == category)
+    
+    if filters:
+        query = query.filter(and_(*filters))
+    
+    # Применяем курсорную пагинацию
+    if cursor_data:
+        cursor_created_at, cursor_id = cursor_data
+        # Для SQLite используем составное условие
+        query = query.filter(
+            or_(
+                Item.created_at < cursor_created_at,
+                and_(Item.created_at == cursor_created_at, Item.id < cursor_id)
+            )
+        )
+    
+    # Сортируем по created_at DESC, id DESC для стабильного порядка
+    query = query.order_by(Item.created_at.desc(), Item.id.desc())
+    
+    # Берем на один элемент больше для проверки has_more
+    items = query.limit(limit + 1).all()
+    
+    # Определяем has_more и обрезаем лишний элемент
+    has_more = len(items) > limit
+    if has_more:
+        items = items[:limit]
+    
+    # Генерируем next_cursor из последнего элемента
+    next_cursor = None
+    if has_more and items:
+        last_item = items[-1]
+        # Получаем фактические значения из SQLAlchemy объекта
+        # last_item.created_at и last_item.id уже содержат фактические значения
+        next_cursor = encode_cursor(last_item.created_at, last_item.id)  # type: ignore
+    
+    logger.info("Items listed successfully", 
+                items_count=len(items), has_more=has_more, next_cursor=next_cursor)
+    
+    return ItemListResponse(
+        items=[ItemResponse.model_validate(item) for item in items],
+        next_cursor=next_cursor,
+        has_more=has_more
+    )

@@ -359,6 +359,366 @@ LIMIT 100;
 - [ ] Нет блокировок и дедлоков
 - [ ] Целостность данных сохраняется
 
+## Сценарий 6: Курсорная пагинация
+
+### Описание
+Тестирование курсорной (keyset) пагинации для эндпоинта `/api/v1/items` с использованием пары `(created_at, id)`.
+
+### Подготовка данных
+```python
+# Создание тестовых данных для пагинации
+def create_test_items_for_pagination(count: int):
+    """Создает тестовые items с разными временными метками"""
+    items = []
+    base_time = datetime.now(timezone.utc)
+    
+    for i in range(count):
+        item = Item(
+            sku=f"PAGINATION-{i:06d}",
+            title=f"Pagination Test Item {i}",
+            status="active" if i % 2 == 0 else "inactive",
+            brand=f"Brand {i % 3}",
+            category=f"Category {i % 2}",
+            created_at=base_time + timedelta(seconds=i)
+        )
+        items.append(item)
+    
+    return items
+```
+
+### Тестовые случаи
+
+#### 6.1 Стабильность порядка
+```python
+def test_pagination_stability():
+    """Тест стабильного порядка между страницами"""
+    # Создаем 300 items
+    items = create_test_items_for_pagination(300)
+    
+    all_items = []
+    cursor = None
+    page_count = 0
+    
+    # Проходим несколько страниц
+    while page_count < 5:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        
+        response = client.get("/api/v1/items", params=params)
+        assert response.status_code == 200
+        
+        data = response.json()
+        all_items.extend(data["items"])
+        
+        if not data["has_more"]:
+            break
+            
+        cursor = data["next_cursor"]
+        page_count += 1
+    
+    # Проверяем отсутствие дубликатов
+    item_ids = [item["id"] for item in all_items]
+    assert len(item_ids) == len(set(item_ids))
+    
+    # Проверяем стабильный порядок
+    assert item_ids == sorted(item_ids, reverse=True)
+```
+
+#### 6.2 Отсутствие дрейфа при вставках
+```python
+def test_no_drift_on_insertions():
+    """Тест отсутствия дрейфа при вставках во время пагинации"""
+    # Создаем 100 items
+    items = create_test_items_for_pagination(100)
+    
+    # Получаем первую страницу
+    response1 = client.get("/api/v1/items?limit=50")
+    data1 = response1.json()
+    cursor = data1["next_cursor"]
+    
+    # Добавляем 50 новых items
+    new_items = create_test_items_for_pagination(50)
+    
+    # Получаем вторую страницу с тем же курсором
+    response2 = client.get(f"/api/v1/items?limit=50&cursor={cursor}")
+    data2 = response2.json()
+    
+    # Проверяем, что новые items не попали на вторую страницу
+    page1_ids = {item["id"] for item in data1["items"]}
+    page2_ids = {item["id"] for item in data2["items"]}
+    new_item_ids = {item.id for item in new_items}
+    
+    assert len(page2_ids & new_item_ids) == 0
+    assert len(page1_ids & page2_ids) == 0
+```
+
+#### 6.3 Фильтрация с пагинацией
+```python
+def test_pagination_with_filters():
+    """Тест пагинации с фильтрами"""
+    # Создаем items с разными статусами
+    active_items = create_test_items_for_pagination(50, status="active")
+    inactive_items = create_test_items_for_pagination(30, status="inactive")
+    
+    # Тестируем фильтрацию по статусу
+    response = client.get("/api/v1/items?status=active&limit=20")
+    assert response.status_code == 200
+    
+    data = response.json()
+    assert all(item["status"] == "active" for item in data["items"])
+    
+    # Тестируем пагинацию с фильтром
+    if data["has_more"]:
+        response2 = client.get(f"/api/v1/items?status=active&limit=20&cursor={data['next_cursor']}")
+        assert response2.status_code == 200
+        data2 = response2.json()
+        assert all(item["status"] == "active" for item in data2["items"])
+```
+
+#### 6.4 Обработка ошибок курсора
+```python
+def test_cursor_error_handling():
+    """Тест обработки ошибок курсора"""
+    # Невалидный base64
+    response = client.get("/api/v1/items?cursor=invalid-base64!")
+    assert response.status_code == 400
+    assert "Invalid cursor format" in response.json()["detail"]
+    
+    # Невалидный JSON
+    invalid_json = base64.b64encode("invalid json".encode('utf-8')).decode('utf-8')
+    response = client.get(f"/api/v1/items?cursor={invalid_json}")
+    assert response.status_code == 400
+    
+    # Отсутствующие поля
+    cursor_data = {"created_at": "2024-01-15T10:30:00Z"}
+    cursor = base64.b64encode(json.dumps(cursor_data).encode('utf-8')).decode('utf-8')
+    response = client.get(f"/api/v1/items?cursor={cursor}")
+    assert response.status_code == 400
+```
+
+#### 6.5 Производительность глубокой пагинации
+```python
+def test_deep_pagination_performance():
+    """Тест производительности глубокой пагинации"""
+    # Создаем 1000+ items
+    items = create_test_items_for_pagination(1000)
+    
+    cursor = None
+    page_count = 0
+    start_time = time.time()
+    
+    # Проходим 10+ страниц
+    while page_count < 12:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        
+        response = client.get("/api/v1/items", params=params)
+        assert response.status_code == 200
+        
+        data = response.json()
+        
+        if not data["has_more"]:
+            break
+            
+        cursor = data["next_cursor"]
+        page_count += 1
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Проверяем, что время ответа приемлемое
+    assert total_time < 1.0  # Менее 1 секунды для 10+ страниц
+    assert page_count >= 10
+```
+
+### Критерии успеха
+- [ ] Порядок элементов стабилен между страницами
+- [ ] Новые вставки не вызывают дрейф страниц
+- [ ] Фильтрация работает корректно с пагинацией
+- [ ] Ошибки курсора обрабатываются с HTTP 400
+- [ ] Производительность остается стабильной на глубине 1000+ страниц
+- [ ] P95 latency < 100ms для одной страницы
+
+## Сценарий 7: Идемпотентность POST операций
+
+### Описание
+Тестирование системы идемпотентности для POST запросов с использованием заголовка `Idempotency-Key`.
+
+### Подготовка
+```python
+# Очистка таблиц идемпотентности
+def cleanup_idempotency_tables():
+    db = SessionLocal()
+    try:
+        db.query(IdempotencyKey).delete()
+        db.query(Item).delete()
+        db.commit()
+    finally:
+        db.close()
+```
+
+### Тестовые случаи
+
+#### 7.1 Базовые сценарии идемпотентности
+```python
+def test_basic_idempotency():
+    """Тест базовой идемпотентности"""
+    item_data = {
+        "sku": "IDEMPOTENCY-001",
+        "title": "Idempotency Test Item",
+        "status": "active"
+    }
+    
+    headers = {"Idempotency-Key": "test-key-001"}
+    
+    # Первый запрос
+    response1 = client.post("/api/v1/items", json=item_data, headers=headers)
+    assert response1.status_code == 201
+    data1 = response1.json()
+    
+    # Повторный запрос с тем же ключом и телом
+    response2 = client.post("/api/v1/items", json=item_data, headers=headers)
+    assert response2.status_code == 201
+    data2 = response2.json()
+    
+    # Ответы должны быть идентичными
+    assert data1 == data2
+    
+    # В БД должен быть только один item
+    items = db.query(Item).filter(Item.sku == "IDEMPOTENCY-001").all()
+    assert len(items) == 1
+```
+
+#### 7.2 Конфликт идемпотентности
+```python
+def test_idempotency_conflict():
+    """Тест конфликта при разных телах запроса"""
+    item_data1 = {
+        "sku": "IDEMPOTENCY-002",
+        "title": "Item 1",
+        "status": "active"
+    }
+    
+    item_data2 = {
+        "sku": "IDEMPOTENCY-003",
+        "title": "Item 2",
+        "status": "active"
+    }
+    
+    headers = {"Idempotency-Key": "conflict-test-key"}
+    
+    # Первый запрос
+    response1 = client.post("/api/v1/items", json=item_data1, headers=headers)
+    assert response1.status_code == 201
+    
+    # Второй запрос с другим телом
+    response2 = client.post("/api/v1/items", json=item_data2, headers=headers)
+    assert response2.status_code == 409
+    
+    error_data = response2.json()
+    assert error_data["error_code"] == "IDEMPOTENCY_KEY_CONFLICT"
+```
+
+#### 7.3 Race conditions
+```python
+def test_race_conditions():
+    """Тест race conditions при параллельных запросах"""
+    item_data = {
+        "sku": "RACE-TEST-001",
+        "title": "Race Test Item",
+        "status": "active"
+    }
+    
+    headers = {"Idempotency-Key": "race-test-key"}
+    
+    # Симулируем параллельные запросы
+    responses = []
+    
+    def make_request():
+        response = client.post("/api/v1/items", json=item_data, headers=headers)
+        responses.append(response)
+    
+    # Создаём несколько потоков
+    threads = []
+    for _ in range(3):
+        thread = threading.Thread(target=make_request)
+        threads.append(thread)
+        thread.start()
+    
+    # Ждём завершения
+    for thread in threads:
+        thread.join()
+    
+    # Проверяем результаты
+    success_count = sum(1 for r in responses if r.status_code == 201)
+    conflict_count = sum(1 for r in responses if r.status_code == 409)
+    
+    assert success_count == 1
+    assert conflict_count == 2
+```
+
+#### 7.4 TTL и временные интервалы
+```python
+def test_ttl_mechanism():
+    """Тест механизма TTL"""
+    item_data = {
+        "sku": "TTL-TEST-001",
+        "title": "TTL Test Item",
+        "status": "active"
+    }
+    
+    headers = {"Idempotency-Key": "ttl-test-key"}
+    
+    # Первый запрос
+    response1 = client.post("/api/v1/items", json=item_data, headers=headers)
+    assert response1.status_code == 201
+    
+    # Симулируем истечение TTL
+    db = SessionLocal()
+    try:
+        key = db.query(IdempotencyKey).filter(IdempotencyKey.key == "ttl-test-key").first()
+        key.expires_at = datetime.utcnow() - timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+    
+    # Новый запрос должен пройти
+    response2 = client.post("/api/v1/items", json=item_data, headers=headers)
+    assert response2.status_code == 201
+```
+
+#### 7.5 Валидация ключей
+```python
+def test_key_validation():
+    """Тест валидации ключей идемпотентности"""
+    item_data = {"sku": "VALID-001", "title": "Test", "status": "active"}
+    
+    # Невалидные ключи
+    invalid_keys = [
+        "",  # Пустой
+        "a" * 256,  # Слишком длинный
+        "invalid@key#123",  # Специальные символы
+        "key with spaces"  # Пробелы
+    ]
+    
+    for invalid_key in invalid_keys:
+        headers = {"Idempotency-Key": invalid_key}
+        response = client.post("/api/v1/items", json=item_data, headers=headers)
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "INVALID_IDEMPOTENCY_KEY"
+```
+
+### Критерии успеха
+- [ ] Повторные запросы с тем же ключом возвращают тот же ответ
+- [ ] Конфликты при разных телах обрабатываются корректно
+- [ ] Race conditions не создают дублирующие записи
+- [ ] TTL механизм работает правильно
+- [ ] Валидация ключей отклоняет невалидные форматы
+- [ ] Hit rate идемпотентности > 80% при нормальной работе
+- [ ] Время ответа кэшированных запросов < 50ms
+
 ## Мониторинг и метрики
 
 ### Ключевые метрики
@@ -367,16 +727,30 @@ LIMIT 100;
 - Количество блокировок
 - Размер таблиц и индексов
 - Статистика по операциям
+- **api.items.list.latency_ms** - время ответа пагинации
+- **api.items.list.pages_depth** - глубина пагинации
+- **api.items.list.cursor_errors** - ошибки декодирования курсора
+- **idempotency.hit** - попадания в кэш идемпотентности
+- **idempotency.miss** - промахи кэша идемпотентности
+- **idempotency.conflict** - конфликты идемпотентности
+- **idempotency.cleanup.count** - количество очищенных ключей
 
 ### Алерты
 - Время выполнения запроса > 1 секунды
 - Отсутствие использования индекса
 - Высокий уровень блокировок
 - Быстрый рост размера таблиц
+- **Время ответа пагинации > 100ms**
+- **Высокий уровень ошибок курсора**
+- **Hit rate идемпотентности < 50%**
+- **Высокий уровень конфликтов идемпотентности**
 
 ### Логирование
 - Все DDL операции
 - Медленные запросы (> 100ms)
 - Ошибки уникальности
 - Откаты транзакций
+- **Метрики курсорной пагинации**
+- **Операции идемпотентности (hit/miss/conflict)**
+- **Очистка истёкших ключей**
 
